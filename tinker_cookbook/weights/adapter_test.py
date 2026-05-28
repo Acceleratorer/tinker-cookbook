@@ -6,13 +6,14 @@ pipeline without requiring real HF models or network access.
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
 from tinker_cookbook.exceptions import WeightsAdapterError
-from tinker_cookbook.weights._adapter import build_lora_adapter
+from tinker_cookbook.weights._adapter import FusedProjectionCompression, build_lora_adapter
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -820,6 +821,57 @@ class TestNemotronMoE:
         assert config["rank_pattern"]["in_proj"] == RANK * 2
         assert config["alpha_pattern"]["in_proj"] == ALPHA * 2
 
+    def test_mamba_fused_projection_rank_cap(self, tmp_path: Path) -> None:
+        """Optional rank cap compresses fused in_proj back to the requested rank."""
+        model_dir = tmp_path / "model"
+        adapter_dir = tmp_path / "adapter"
+        output_dir = tmp_path / "output"
+
+        _create_synthetic_model(model_dir, _NEMOTRON_MOE_CONFIG, _make_nemotron_moe_state_dict())
+        _create_adapter(adapter_dir, _make_nemotron_moe_adapter_weights())
+
+        build_lora_adapter(
+            base_model=str(model_dir),
+            adapter_path=str(adapter_dir),
+            output_path=str(output_dir),
+            fused_projection_rank_cap=RANK,
+        )
+
+        weights, config = _load_peft_output(output_dir)
+
+        in_proj_A = weights["base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"]
+        in_proj_B = weights["base_model.model.model.layers.0.mixer.in_proj.lora_B.weight"]
+        assert in_proj_A.shape == (RANK, HIDDEN)
+        assert in_proj_B.shape == (NEMOTRON_IN_PROJ_OUT, RANK)
+        assert config["rank_pattern"]["in_proj"] == RANK
+        assert config["alpha_pattern"]["in_proj"] == ALPHA
+
+    def test_mamba_fused_projection_balanced_rank_cap(self, tmp_path: Path) -> None:
+        """Balanced compression is accepted for rank-capped fused projections."""
+        model_dir = tmp_path / "model"
+        adapter_dir = tmp_path / "adapter"
+        output_dir = tmp_path / "output"
+
+        _create_synthetic_model(model_dir, _NEMOTRON_MOE_CONFIG, _make_nemotron_moe_state_dict())
+        _create_adapter(adapter_dir, _make_nemotron_moe_adapter_weights())
+
+        build_lora_adapter(
+            base_model=str(model_dir),
+            adapter_path=str(adapter_dir),
+            output_path=str(output_dir),
+            fused_projection_rank_cap=RANK,
+            fused_projection_compression="balanced_svd",
+        )
+
+        weights, _ = _load_peft_output(output_dir)
+
+        in_proj_A = weights["base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"]
+        in_proj_B = weights["base_model.model.model.layers.0.mixer.in_proj.lora_B.weight"]
+        assert in_proj_A.shape == (RANK, HIDDEN)
+        assert in_proj_B.shape == (NEMOTRON_IN_PROJ_OUT, RANK)
+        assert torch.isfinite(in_proj_A).all()
+        assert torch.isfinite(in_proj_B).all()
+
     def test_per_expert_tensors_are_2d(self, tmp_path: Path) -> None:
         """All output tensors should be 2D (3D experts expanded to per-expert 2D)."""
         model_dir = tmp_path / "model"
@@ -1040,6 +1092,25 @@ class TestValidation:
                 base_model=str(model_dir),
                 adapter_path=str(adapter_dir),
                 output_path=str(output_dir),
+            )
+
+    def test_invalid_fused_projection_rank_cap_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(WeightsAdapterError, match="rank_cap"):
+            build_lora_adapter(
+                base_model=str(tmp_path),
+                adapter_path=str(tmp_path),
+                output_path=str(tmp_path / "output"),
+                fused_projection_rank_cap=0,
+            )
+
+    def test_invalid_fused_projection_compression_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(WeightsAdapterError, match="fused_projection_compression"):
+            build_lora_adapter(
+                base_model=str(tmp_path),
+                adapter_path=str(tmp_path),
+                output_path=str(tmp_path / "output"),
+                fused_projection_rank_cap=RANK,
+                fused_projection_compression=cast(FusedProjectionCompression, "bad"),
             )
 
     def test_output_files_exist(self, tmp_path: Path) -> None:

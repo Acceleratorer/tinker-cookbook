@@ -19,6 +19,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Literal
 
 import torch
 from safetensors.torch import save_file
@@ -49,6 +50,8 @@ from tinker_cookbook.weights._merge_utils import (
 
 logger = logging.getLogger(__name__)
 
+FusedProjectionCompression = Literal["joint_svd", "balanced_svd"]
+
 # Model types (from config.json "model_type") that do not support adapter conversion.
 # Keyed by the exact model_type string so that future models in the same family
 # (e.g. a hypothetical DeepSeek V4 with LoRA support) are not accidentally blocked.
@@ -78,6 +81,8 @@ def build_lora_adapter(
     adapter_path: str,
     output_path: str,
     trust_remote_code: bool | None = None,
+    fused_projection_rank_cap: int | None = None,
+    fused_projection_compression: FusedProjectionCompression = "joint_svd",
 ) -> None:
     """Convert a Tinker LoRA adapter to standard PEFT format for serving.
 
@@ -96,6 +101,13 @@ def build_lora_adapter(
         trust_remote_code: Whether to trust remote code when loading HF
             model configs. If ``None`` (default), falls back to the
             ``HF_TRUST_REMOTE_CODE`` environment variable, then ``False``.
+        fused_projection_rank_cap: Optional maximum LoRA rank for fused
+            projection targets (for example Nemotron Mamba ``in_proj``). If
+            unset, fused projections keep the exact merged rank.
+        fused_projection_compression: How to compress fused projections when
+            ``fused_projection_rank_cap`` is set. ``"joint_svd"`` is the best
+            global Frobenius-norm approximation. ``"balanced_svd"`` gives each
+            fused component similar weight before the SVD.
 
     Raises:
         FileNotFoundError: If adapter files are missing.
@@ -106,6 +118,10 @@ def build_lora_adapter(
     # Resolve trust_remote_code from parameter or HF_TRUST_REMOTE_CODE env var,
     # consistent with build_hf_model and get_tokenizer.
     _trust = resolve_trust_remote_code(trust_remote_code)  # reserved for future HF calls
+    _validate_fused_projection_compression(
+        fused_projection_rank_cap,
+        fused_projection_compression,
+    )
     out = Path(output_path)
     if out.exists():
         raise FileExistsError(f"Output path already exists: {out}")
@@ -152,6 +168,8 @@ def build_lora_adapter(
             model_state_keys,
             profile,
             model_state_shapes,
+            fused_projection_rank_cap,
+            fused_projection_compression,
         )
 
         # Apply serving-framework prefix remaps (e.g., backbone.* → model.* for Nemotron).
@@ -189,6 +207,18 @@ def _check_model_support(config_dict: dict) -> None:
     model_type = config_dict.get("model_type", "")
     if model_type in _UNSUPPORTED_MODEL_TYPES:
         raise WeightsAdapterError(_UNSUPPORTED_MODEL_TYPES[model_type])
+
+
+def _validate_fused_projection_compression(
+    rank_cap: int | None,
+    compression: str,
+) -> None:
+    if rank_cap is not None and rank_cap <= 0:
+        raise WeightsAdapterError("fused_projection_rank_cap must be a positive integer")
+    if compression not in ("joint_svd", "balanced_svd"):
+        raise WeightsAdapterError(
+            "fused_projection_compression must be one of: 'joint_svd', 'balanced_svd'"
+        )
 
 
 def _apply_serving_prefix_remaps(
@@ -240,6 +270,8 @@ def _convert_adapter(
     model_state_keys: set[str],
     profile: MergeProfile,
     model_state_shapes: dict[str, tuple[int, ...]] | None = None,
+    fused_projection_rank_cap: int | None = None,
+    fused_projection_compression: FusedProjectionCompression = "joint_svd",
 ) -> tuple[dict[str, torch.Tensor], list[str], dict[str, int]]:
     """Convert Tinker adapter weights to PEFT-compatible format.
 
@@ -334,6 +366,8 @@ def _convert_adapter(
                 peft_weights,
                 target_modules,
                 profile,
+                fused_projection_rank_cap,
+                fused_projection_compression,
             )
             rank_overrides[fused_target] = fused_rank
 
@@ -380,6 +414,8 @@ def _merge_fused_projections(
     peft_weights: dict[str, torch.Tensor],
     target_modules: set[str],
     profile: MergeProfile,
+    rank_cap: int | None = None,
+    compression: FusedProjectionCompression = "joint_svd",
 ) -> int:
     """Merge component LoRA weights into a fused projection target.
 
@@ -398,7 +434,8 @@ def _merge_fused_projections(
         adapter_layer_prefix: The adapter-namespace layer prefix
             (e.g. ``model.layers.0.mixer``), used to construct PEFT keys.
 
-    Returns the merged LoRA rank (sum of component ranks).
+    Returns the merged LoRA rank. If ``rank_cap`` is provided and smaller
+    than the exact merged rank, the fused pair is compressed to that rank.
     """
     fused_out_dim = model_state_shapes[fused_model_key][0]
 
@@ -440,18 +477,98 @@ def _merge_fused_projections(
     merged_lora_A = torch.cat(lora_A_parts, dim=0)
 
     # lora_B: (fused_out_dim, merged_rank) — block-diagonal placement
-    merged_lora_B = torch.zeros(fused_out_dim, merged_rank, dtype=lora_A_parts[0].dtype)
+    merged_lora_B = torch.zeros(
+        fused_out_dim,
+        merged_rank,
+        dtype=lora_A_parts[0].dtype,
+        device=lora_A_parts[0].device,
+    )
     rank_offset = 0
     for i, (row_start, row_end, r) in enumerate(comp_slices):
         _, lora_B = comp_by_name[component_order[i]]
         merged_lora_B[row_start:row_end, rank_offset : rank_offset + r] = lora_B
         rank_offset += r
 
+    final_rank = merged_rank
+    if rank_cap is not None and merged_rank > rank_cap:
+        row_weights = None
+        if compression == "balanced_svd":
+            row_weights = _balanced_component_row_weights(
+                fused_out_dim,
+                component_order,
+                comp_by_name,
+                comp_slices,
+                merged_lora_A.device,
+            )
+        merged_lora_B, merged_lora_A = _compress_lora_pair_to_rank(
+            merged_lora_B,
+            merged_lora_A,
+            rank_cap,
+            row_weights=row_weights,
+        )
+        final_rank = merged_lora_A.shape[0]
+
     # Use the adapter-namespace prefix for the PEFT output key (the serving
     # prefix remap will be applied later by the caller if needed).
     peft_target_key = f"{adapter_layer_prefix}.{fused_target_name}.weight"
     _add_peft_weight(peft_target_key, merged_lora_A, merged_lora_B, peft_weights, target_modules)
-    return merged_rank
+    return final_rank
+
+
+def _compress_lora_pair_to_rank(
+    lora_B: torch.Tensor,
+    lora_A: torch.Tensor,
+    rank: int,
+    *,
+    row_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a rank-k LoRA pair approximating ``lora_B @ lora_A``."""
+    rank = min(int(rank), lora_B.shape[0], lora_B.shape[1], lora_A.shape[0], lora_A.shape[1])
+    delta = lora_B.float() @ lora_A.float()
+    weights: torch.Tensor | None = None
+    if row_weights is not None:
+        weights = row_weights.to(device=delta.device, dtype=delta.dtype).clamp_min(1e-12)
+        delta = delta * weights.unsqueeze(1)
+
+    u, s, vh = torch.linalg.svd(delta, full_matrices=False)
+    u = u[:, :rank]
+    s = s[:rank]
+    vh = vh[:rank, :]
+
+    sroot = torch.sqrt(torch.clamp(s, min=0))
+    new_B = u * sroot.unsqueeze(0)
+    if weights is not None:
+        new_B = new_B / weights.unsqueeze(1)
+    new_A = sroot.unsqueeze(1) * vh
+    return (
+        new_B.to(device=lora_B.device, dtype=lora_B.dtype).contiguous(),
+        new_A.to(device=lora_A.device, dtype=lora_A.dtype).contiguous(),
+    )
+
+
+def _balanced_component_row_weights(
+    fused_out_dim: int,
+    component_order: tuple[str, ...],
+    comp_by_name: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    comp_slices: list[tuple[int, int, int]],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build row weights that give each fused component similar SVD weight."""
+    component_norms: list[float] = []
+    for comp_name in component_order:
+        lora_A, lora_B = comp_by_name[comp_name]
+        component_norms.append(float((lora_B.float() @ lora_A.float()).norm().item()))
+
+    positive_norms = [n for n in component_norms if n > 0]
+    if not positive_norms:
+        return torch.ones(fused_out_dim, dtype=torch.float32, device=device)
+
+    mean_norm = sum(positive_norms) / len(positive_norms)
+    row_weights = torch.ones(fused_out_dim, dtype=torch.float32, device=device)
+    for (row_start, row_end, _), norm in zip(comp_slices, component_norms, strict=True):
+        if norm > 0:
+            row_weights[row_start:row_end] = mean_norm / norm
+    return row_weights
 
 
 def _add_peft_weight(
