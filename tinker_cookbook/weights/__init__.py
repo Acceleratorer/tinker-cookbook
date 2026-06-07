@@ -35,7 +35,11 @@ Example — PEFT adapter for serving::
     # Then serve with: vllm serve Qwen/Qwen3-8B --lora-modules my_adapter=./peft_adapter
 """
 
-from tinker_cookbook.weights._adapter import build_lora_adapter
+from tinker_cookbook.weights._adapter import (
+    AdapterBlendSpec,
+    build_blended_lora_adapter,
+    build_lora_adapter,
+)
 from tinker_cookbook.weights._download import download
 from tinker_cookbook.weights._export import build_hf_model
 from tinker_cookbook.weights._model_card import ModelCardConfig, generate_model_card
@@ -43,6 +47,8 @@ from tinker_cookbook.weights._publish import publish_to_hf_hub
 
 __all__ = [
     "ModelCardConfig",
+    "AdapterBlendSpec",
+    "build_blended_lora_adapter",
     "build_hf_model",
     "build_lora_adapter",
     "download",

@@ -13,7 +13,11 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from tinker_cookbook.exceptions import WeightsAdapterError
-from tinker_cookbook.weights._adapter import FusedProjectionCompression, build_lora_adapter
+from tinker_cookbook.weights._adapter import (
+    FusedProjectionCompression,
+    build_blended_lora_adapter,
+    build_lora_adapter,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -191,6 +195,110 @@ class TestDenseConversion:
 
         _, config = _load_peft_output(output_dir)
         assert sorted(config["target_modules"]) == ["gate_proj", "q_proj"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Adapter blending
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterBlending:
+    def test_dense_blend_respects_source_scales(self, tmp_path: Path) -> None:
+        model_dir = tmp_path / "model"
+        adapter_a = tmp_path / "adapter_a"
+        adapter_b = tmp_path / "adapter_b"
+        output_dir = tmp_path / "output"
+
+        _create_synthetic_model(model_dir, _DENSE_CONFIG, _DENSE_STATE_DICT)
+
+        generator = torch.Generator().manual_seed(0)
+        a_A = torch.randn(RANK, HIDDEN, generator=generator)
+        a_B = torch.randn(OUT_DIM, RANK, generator=generator)
+        b_A = torch.randn(RANK, HIDDEN, generator=generator)
+        b_B = torch.randn(OUT_DIM, RANK, generator=generator)
+        key_prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+        _create_adapter(
+            adapter_a,
+            {
+                f"{key_prefix}.lora_A.weight": a_A,
+                f"{key_prefix}.lora_B.weight": a_B,
+            },
+            lora_alpha=4,
+            rank=RANK,
+        )
+        _create_adapter(
+            adapter_b,
+            {
+                f"{key_prefix}.lora_A.weight": b_A,
+                f"{key_prefix}.lora_B.weight": b_B,
+            },
+            lora_alpha=2,
+            rank=RANK,
+        )
+
+        build_blended_lora_adapter(
+            base_model=str(model_dir),
+            adapters=[(str(adapter_a), 0.75), (str(adapter_b), 0.25)],
+            output_path=str(output_dir),
+            blend_rank_cap=RANK * 2,
+        )
+
+        weights, config = _load_peft_output(output_dir)
+
+        assert config["r"] == RANK * 2
+        assert config["lora_alpha"] == RANK * 2
+        out_A = weights[f"{key_prefix}.lora_A.weight"]
+        out_B = weights[f"{key_prefix}.lora_B.weight"]
+        blended_delta = out_B.float() @ out_A.float()
+        expected_delta = 0.75 * (4 / RANK) * (a_B @ a_A) + 0.25 * (2 / RANK) * (b_B @ b_A)
+        assert torch.allclose(blended_delta, expected_delta, atol=1e-4, rtol=1e-4)
+
+    def test_missing_anchor_stem_is_renormalized(self, tmp_path: Path) -> None:
+        model_dir = tmp_path / "model"
+        adapter_a = tmp_path / "adapter_a"
+        adapter_b = tmp_path / "adapter_b"
+        output_dir = tmp_path / "output"
+
+        _create_synthetic_model(model_dir, _DENSE_CONFIG, _DENSE_STATE_DICT)
+
+        q_prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+        gate_prefix = "base_model.model.model.layers.0.mlp.gate_proj"
+        gate_A = torch.randn(RANK, HIDDEN, generator=torch.Generator().manual_seed(1))
+        gate_B = torch.randn(OUT_DIM, RANK, generator=torch.Generator().manual_seed(2))
+        _create_adapter(
+            adapter_a,
+            {
+                f"{q_prefix}.lora_A.weight": torch.ones(RANK, HIDDEN),
+                f"{q_prefix}.lora_B.weight": torch.ones(OUT_DIM, RANK),
+                f"{gate_prefix}.lora_A.weight": gate_A,
+                f"{gate_prefix}.lora_B.weight": gate_B,
+            },
+            lora_alpha=4,
+            rank=RANK,
+        )
+        _create_adapter(
+            adapter_b,
+            {
+                f"{q_prefix}.lora_A.weight": torch.ones(RANK, HIDDEN) * 2,
+                f"{q_prefix}.lora_B.weight": torch.ones(OUT_DIM, RANK) * 2,
+            },
+            lora_alpha=4,
+            rank=RANK,
+        )
+
+        build_blended_lora_adapter(
+            base_model=str(model_dir),
+            adapters=[(str(adapter_a), 0.25), (str(adapter_b), 0.75)],
+            output_path=str(output_dir),
+            blend_rank_cap=RANK,
+        )
+
+        weights, _ = _load_peft_output(output_dir)
+
+        out_A = weights[f"{gate_prefix}.lora_A.weight"]
+        out_B = weights[f"{gate_prefix}.lora_B.weight"]
+        expected_delta = (4 / RANK) * (gate_B @ gate_A)
+        assert torch.allclose(out_B.float() @ out_A.float(), expected_delta, atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +821,43 @@ def _make_nemotron_moe_adapter_weights() -> dict[str, torch.Tensor]:
 
 
 class TestNemotronMoE:
+    def test_blended_adapter_handles_nemotron_fused_projection(self, tmp_path: Path) -> None:
+        """Blended Nemotron adapters should still fuse Mamba projections to rank-capped PEFT."""
+        model_dir = tmp_path / "model"
+        adapter_a = tmp_path / "adapter_a"
+        adapter_b = tmp_path / "adapter_b"
+        output_dir = tmp_path / "output"
+
+        _create_synthetic_model(model_dir, _NEMOTRON_MOE_CONFIG, _make_nemotron_moe_state_dict())
+        adapter_a_weights = _make_nemotron_moe_adapter_weights()
+        adapter_b_weights = {
+            key: value.clone() * 0.5 if value.numel() else value.clone()
+            for key, value in adapter_a_weights.items()
+        }
+        _create_adapter(adapter_a, adapter_a_weights)
+        _create_adapter(adapter_b, adapter_b_weights)
+
+        build_blended_lora_adapter(
+            base_model=str(model_dir),
+            adapters=[(str(adapter_a), 0.8), (str(adapter_b), 0.2)],
+            output_path=str(output_dir),
+            blend_rank_cap=RANK,
+            fused_projection_rank_cap=RANK,
+        )
+
+        weights, config = _load_peft_output(output_dir)
+
+        assert not any("backbone" in key for key in weights)
+        assert not any("gate_proj" in key for key in weights if "experts" not in key)
+        assert not any("x_proj" in key for key in weights)
+        in_proj_A = weights["base_model.model.model.layers.0.mixer.in_proj.lora_A.weight"]
+        in_proj_B = weights["base_model.model.model.layers.0.mixer.in_proj.lora_B.weight"]
+        assert in_proj_A.shape == (RANK, HIDDEN)
+        assert in_proj_B.shape == (NEMOTRON_IN_PROJ_OUT, RANK)
+        assert config["rank_pattern"]["in_proj"] == RANK
+        assert config["alpha_pattern"]["in_proj"] == RANK
+        assert "in_proj" in config["target_modules"]
+
     def test_empty_expert_tensors_skipped(self, tmp_path: Path) -> None:
         """Empty w3 expert LoRA tensors should be skipped without error."""
         model_dir = tmp_path / "model"

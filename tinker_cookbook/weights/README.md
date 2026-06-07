@@ -62,6 +62,33 @@ Default settings that work well across models:
 | `lora_alpha` | 32 | Common to set `alpha = rank`. Effective scaling = `alpha / rank`. |
 | Merge scaling | `alpha / rank` | Applied automatically during `build_hf_model`. |
 
+### Adapter Blending
+
+Use `build_blended_lora_adapter` when you want to combine several Tinker
+LoRA adapters into one PEFT serving adapter. The helper blends effective LoRA
+deltas, preserves each source adapter's `lora_alpha / r` scale, then runs the
+normal model-specific adapter conversion path.
+
+```python
+from tinker_cookbook import weights
+
+weights.build_blended_lora_adapter(
+    base_model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    adapters=[
+        ("/path/to/adapter-v20", 0.85),
+        ("/path/to/adapter-v25", 0.10),
+        ("/path/to/adapter-v23", 0.05),
+    ],
+    output_path="./peft-blend",
+    blend_rank_cap=32,
+    stem_policy="anchor",
+    fused_projection_rank_cap=32,
+)
+```
+
+`stem_policy="anchor"` keeps the first adapter's LoRA coverage, which is a
+conservative choice when the first adapter is a known-good baseline.
+
 ### Merge Strategy
 
 | Strategy | When to use | Peak memory |

@@ -169,8 +169,14 @@ class TestWeightsExports:
         _check_all_exports("tinker_cookbook.weights")
 
     def test_core_functions_importable(self):
-        from tinker_cookbook.weights import build_hf_model, build_lora_adapter, download
+        from tinker_cookbook.weights import (
+            build_blended_lora_adapter,
+            build_hf_model,
+            build_lora_adapter,
+            download,
+        )
 
+        assert callable(build_blended_lora_adapter)
         assert callable(build_hf_model)
         assert callable(build_lora_adapter)
         assert callable(download)

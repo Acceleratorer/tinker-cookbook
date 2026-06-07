@@ -18,8 +18,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 from safetensors.torch import save_file
@@ -51,6 +52,34 @@ from tinker_cookbook.weights._merge_utils import (
 logger = logging.getLogger(__name__)
 
 FusedProjectionCompression = Literal["joint_svd", "balanced_svd"]
+BlendStemPolicy = Literal["anchor", "intersection", "union"]
+
+
+class AdapterBlendSpec(NamedTuple):
+    """One adapter and its coefficient for adapter blending."""
+
+    adapter_path: str
+    weight: float
+
+
+class _LoadedAdapter(NamedTuple):
+    """In-memory adapter payload used by the blending implementation."""
+
+    path: Path
+    weight: float
+    weights: dict[str, torch.Tensor]
+    config: dict
+    names: set[str]
+
+
+class _BlendPair(NamedTuple):
+    """A single available LoRA pair for one adapter weight name."""
+
+    coefficient: float
+    scale: float
+    lora_A: torch.Tensor
+    lora_B: torch.Tensor
+
 
 # Model types (from config.json "model_type") that do not support adapter conversion.
 # Keyed by the exact model_type string so that future models in the same family
@@ -73,6 +102,137 @@ _UNSUPPORTED_MODEL_TYPES: dict[str, str] = {
 _SERVING_PREFIX_REMAPS: dict[str, tuple[tuple[str, str], ...]] = {
     "nemotron_h": (("backbone.", "model."),),
 }
+
+
+def build_blended_lora_adapter(
+    *,
+    base_model: str,
+    adapters: Sequence[AdapterBlendSpec | tuple[str, float]],
+    output_path: str,
+    trust_remote_code: bool | None = None,
+    blend_rank_cap: int | None = None,
+    normalize_weights: bool = True,
+    renormalize_missing: bool = True,
+    stem_policy: BlendStemPolicy = "anchor",
+    fused_projection_rank_cap: int | None = None,
+    fused_projection_compression: FusedProjectionCompression = "joint_svd",
+) -> None:
+    """Blend Tinker LoRA adapters and convert the result to PEFT format.
+
+    This is useful for adapter-soup style experiments where several nearby
+    checkpoints or training runs should be combined into one serving adapter.
+    Blending happens on the effective LoRA deltas before the normal
+    Tinker-to-PEFT conversion, so model-specific remaps, expert expansion, and
+    fused-projection compression are still handled by the standard adapter path.
+
+    The blended intermediate adapter is written with ``lora_alpha == r`` so the
+    PEFT serving scale is 1.0. Source adapter scales (``lora_alpha / r``) are
+    included while blending.
+
+    Args:
+        base_model: HuggingFace model name or local path.
+        adapters: Sequence of ``(adapter_path, weight)`` pairs. The first
+            adapter is the anchor when ``stem_policy="anchor"``.
+        output_path: Directory where the PEFT adapter will be saved. Must not
+            already exist.
+        trust_remote_code: Whether to trust remote code when loading HF model
+            configs. If ``None`` (default), follows the standard cookbook
+            environment-variable behavior.
+        blend_rank_cap: Rank used for each blended LoRA pair before model
+            conversion. Defaults to the first adapter's rank.
+        normalize_weights: If true, divide blend weights by their total.
+        renormalize_missing: If true, when a selected LoRA pair is missing from
+            some adapters, renormalize the available adapter coefficients for
+            that pair.
+        stem_policy: Which source LoRA names to blend: ``"anchor"`` keeps the
+            first adapter's names, ``"intersection"`` keeps names present in all
+            adapters, and ``"union"`` includes every source name.
+        fused_projection_rank_cap: Optional maximum rank for fused projection
+            targets such as Nemotron Mamba ``in_proj``.
+        fused_projection_compression: Compression strategy used for fused
+            projections when ``fused_projection_rank_cap`` is set.
+
+    Raises:
+        FileExistsError: If output_path already exists.
+        WeightsAdapterError: If inputs are malformed or cannot be converted.
+    """
+    _trust = resolve_trust_remote_code(trust_remote_code)  # reserved for future HF calls
+    _validate_fused_projection_compression(
+        fused_projection_rank_cap,
+        fused_projection_compression,
+    )
+    del _trust
+
+    out = Path(output_path)
+    if out.exists():
+        raise FileExistsError(f"Output path already exists: {out}")
+
+    loaded_adapters = _load_blend_adapters(adapters, normalize_weights=normalize_weights)
+    resolved_blend_rank_cap = _resolve_blend_rank_cap(loaded_adapters, blend_rank_cap)
+    blended_weights = _blend_adapter_weights(
+        loaded_adapters,
+        rank_cap=resolved_blend_rank_cap,
+        renormalize_missing=renormalize_missing,
+        stem_policy=stem_policy,
+    )
+    blended_config = {"lora_alpha": resolved_blend_rank_cap, "r": resolved_blend_rank_cap}
+
+    model_dir = resolve_model_dir(base_model)
+    config_dict = load_config_dict(model_dir)
+    model_state_keys = get_model_state_keys(model_dir)
+
+    profile = detect_merge_profile(config_dict, model_state_keys)
+    _check_model_support(config_dict)
+
+    has_expert_weights = any(".experts" in key for key in blended_weights)
+    if has_expert_weights:
+        _warn_experimental_moe(profile)
+
+    logger.info(
+        "Converting blended adapter for %s (family=%s, expert_layout=%s, sources=%d)",
+        base_model,
+        profile.model_family,
+        profile.expert_layout,
+        len(loaded_adapters),
+    )
+
+    try:
+        out.mkdir(parents=True)
+
+        model_state_shapes: dict[str, tuple[int, ...]] | None = None
+        if profile.fused_projection_map:
+            model_state_shapes = get_model_state_shapes(model_dir)
+
+        peft_weights, target_modules, rank_overrides = _convert_adapter(
+            blended_weights,
+            model_state_keys,
+            profile,
+            model_state_shapes,
+            fused_projection_rank_cap,
+            fused_projection_compression,
+        )
+
+        model_type = config_dict.get("model_type", "")
+        if model_type in _SERVING_PREFIX_REMAPS:
+            peft_weights = _apply_serving_prefix_remaps(peft_weights, model_type)
+
+        peft_config = _build_peft_config(
+            blended_config,
+            base_model,
+            target_modules,
+            rank_overrides,
+        )
+        _write_peft_adapter(out, peft_weights, peft_config)
+
+        logger.info(
+            "Blended PEFT adapter saved to %s (%d weight tensors, target_modules=%s)",
+            out,
+            len(peft_weights),
+            target_modules,
+        )
+    except Exception:
+        cleanup_on_failure(out)
+        raise
 
 
 def build_lora_adapter(
@@ -258,6 +418,312 @@ def _warn_experimental_moe(profile: MergeProfile) -> None:
             "not work with all serving configurations.",
             profile.model_family,
         )
+
+
+# ---------------------------------------------------------------------------
+# Adapter blending
+# ---------------------------------------------------------------------------
+
+
+def _load_blend_adapters(
+    adapters: Sequence[AdapterBlendSpec | tuple[str, float]],
+    *,
+    normalize_weights: bool,
+) -> list[_LoadedAdapter]:
+    """Load and validate source adapters for adapter blending."""
+    if not adapters:
+        raise WeightsAdapterError("At least one adapter is required for blending")
+
+    raw_specs: list[AdapterBlendSpec] = []
+    for raw in adapters:
+        adapter_path, weight = raw
+        coefficient = float(weight)
+        if coefficient < 0:
+            raise WeightsAdapterError("Adapter blend weights must be non-negative")
+        raw_specs.append(AdapterBlendSpec(str(adapter_path), coefficient))
+
+    total_weight = sum(spec.weight for spec in raw_specs)
+    if total_weight <= 0:
+        raise WeightsAdapterError("At least one adapter blend weight must be positive")
+
+    loaded: list[_LoadedAdapter] = []
+    for spec in raw_specs:
+        adapter_weights, adapter_config = load_adapter_weights(Path(spec.adapter_path))
+        for key in ("lora_alpha", "r"):
+            if key not in adapter_config:
+                raise WeightsAdapterError(f"Adapter config missing required key: {key!r}")
+        coefficient = spec.weight / total_weight if normalize_weights else spec.weight
+        loaded.append(
+            _LoadedAdapter(
+                path=Path(spec.adapter_path),
+                weight=coefficient,
+                weights=adapter_weights,
+                config=adapter_config,
+                names=set(extract_adapter_weight_names(adapter_weights)),
+            )
+        )
+    return loaded
+
+
+def _resolve_blend_rank_cap(
+    loaded_adapters: Sequence[_LoadedAdapter],
+    blend_rank_cap: int | None,
+) -> int:
+    """Resolve and validate the rank for blended source LoRA pairs."""
+    if blend_rank_cap is None:
+        rank = int(loaded_adapters[0].config["r"])
+    else:
+        rank = int(blend_rank_cap)
+    if rank <= 0:
+        raise WeightsAdapterError("blend_rank_cap must be a positive integer")
+    return rank
+
+
+def _blend_adapter_weights(
+    loaded_adapters: Sequence[_LoadedAdapter],
+    *,
+    rank_cap: int,
+    renormalize_missing: bool,
+    stem_policy: BlendStemPolicy,
+) -> dict[str, torch.Tensor]:
+    """Blend loaded Tinker adapter weights into one effective adapter."""
+    if stem_policy not in ("anchor", "intersection", "union"):
+        raise WeightsAdapterError("stem_policy must be one of: 'anchor', 'intersection', 'union'")
+
+    selected_names = _select_blend_names(loaded_adapters, stem_policy)
+    if not selected_names:
+        raise WeightsAdapterError("No shared LoRA weight names found to blend")
+
+    output_weights: dict[str, torch.Tensor] = {}
+    for name in selected_names:
+        pairs = _collect_blend_pairs(loaded_adapters, name, renormalize_missing)
+        if not pairs:
+            continue
+
+        lora_A_key, lora_B_key = _lora_pair_keys(name)
+        first = pairs[0]
+
+        if first.lora_A.ndim == 2 and first.lora_B.ndim == 2:
+            lora_B, lora_A = _blend_2d_lora_pairs(pairs, rank_cap)
+        elif first.lora_A.ndim == 3 and first.lora_B.ndim == 3:
+            lora_B, lora_A = _blend_3d_lora_pairs(pairs, rank_cap)
+        else:
+            raise WeightsAdapterError(
+                f"Unsupported LoRA tensor dimensions for {name!r}: "
+                f"A={tuple(first.lora_A.shape)}, B={tuple(first.lora_B.shape)}"
+            )
+
+        output_weights[lora_A_key] = lora_A
+        output_weights[lora_B_key] = lora_B
+
+    if not output_weights:
+        raise WeightsAdapterError("No non-empty LoRA weights found to blend")
+    return output_weights
+
+
+def _select_blend_names(
+    loaded_adapters: Sequence[_LoadedAdapter],
+    stem_policy: BlendStemPolicy,
+) -> list[str]:
+    """Select adapter weight names according to the configured stem policy."""
+    if stem_policy == "anchor":
+        selected = set(loaded_adapters[0].names)
+    elif stem_policy == "intersection":
+        selected = set.intersection(*(adapter.names for adapter in loaded_adapters))
+    else:
+        selected = set.union(*(adapter.names for adapter in loaded_adapters))
+    return sorted(selected)
+
+
+def _collect_blend_pairs(
+    loaded_adapters: Sequence[_LoadedAdapter],
+    name: str,
+    renormalize_missing: bool,
+) -> list[_BlendPair]:
+    """Collect available LoRA pairs for one adapter weight name."""
+    available: list[_BlendPair] = []
+    available_weight = 0.0
+
+    for adapter in loaded_adapters:
+        if name not in adapter.names:
+            continue
+        lora_A_key, lora_B_key = _lora_pair_keys(name)
+        lora_A = adapter.weights[lora_A_key]
+        lora_B = adapter.weights[lora_B_key]
+        if lora_A.numel() == 0 and lora_B.numel() == 0:
+            continue
+        if lora_A.numel() == 0 or lora_B.numel() == 0:
+            raise WeightsAdapterError(
+                f"Adapter {adapter.path} has only one empty tensor for {name!r}"
+            )
+
+        available_weight += adapter.weight
+        available.append(
+            _BlendPair(
+                coefficient=adapter.weight,
+                scale=float(adapter.config["lora_alpha"]) / float(adapter.config["r"]),
+                lora_A=lora_A,
+                lora_B=lora_B,
+            )
+        )
+
+    if not available:
+        return []
+    if renormalize_missing:
+        if available_weight <= 0:
+            raise WeightsAdapterError(f"No positive-weight source available for {name!r}")
+        available = [
+            _BlendPair(
+                coefficient=pair.coefficient / available_weight,
+                scale=pair.scale,
+                lora_A=pair.lora_A,
+                lora_B=pair.lora_B,
+            )
+            for pair in available
+        ]
+    return available
+
+
+def _lora_pair_keys(name: str) -> tuple[str, str]:
+    """Return LoRA A/B tensor keys for an adapter base weight name."""
+    if not name.endswith(".weight"):
+        raise WeightsAdapterError(f"Adapter weight name must end with '.weight': {name!r}")
+    stem = name.removesuffix(".weight")
+    return f"{stem}.lora_A.weight", f"{stem}.lora_B.weight"
+
+
+def _blend_2d_lora_pairs(
+    pairs: Sequence[_BlendPair],
+    rank_cap: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Blend 2D LoRA pairs using a compact QR/SVD factorization."""
+    first = pairs[0]
+    left_parts: list[torch.Tensor] = []
+    right_parts: list[torch.Tensor] = []
+    in_dim = first.lora_A.shape[1]
+    out_dim = first.lora_B.shape[0]
+
+    for pair in pairs:
+        if pair.lora_A.ndim != 2 or pair.lora_B.ndim != 2:
+            raise WeightsAdapterError("Cannot blend tensors with mixed LoRA dimensions")
+        if pair.lora_A.shape[0] != pair.lora_B.shape[1]:
+            raise WeightsAdapterError(
+                f"Rank mismatch while blending: A={tuple(pair.lora_A.shape)}, "
+                f"B={tuple(pair.lora_B.shape)}"
+            )
+        if pair.lora_A.shape[1] != in_dim or pair.lora_B.shape[0] != out_dim:
+            raise WeightsAdapterError(
+                "Cannot blend LoRA pairs with different input/output dimensions"
+            )
+
+        coeff = float(pair.coefficient) * float(pair.scale)
+        if abs(coeff) < 1e-12:
+            continue
+        left_parts.append(pair.lora_B.float() * coeff)
+        right_parts.append(pair.lora_A.float())
+
+    if not left_parts:
+        raise WeightsAdapterError("No non-zero source factors to blend")
+
+    left = torch.cat(left_parts, dim=1)
+    right = torch.cat(right_parts, dim=0)
+
+    q_left, r_left = torch.linalg.qr(left, mode="reduced")
+    q_right, r_right = torch.linalg.qr(right.T, mode="reduced")
+    small = r_left @ r_right.T
+    u, s, vh = torch.linalg.svd(small, full_matrices=False)
+
+    rank = min(rank_cap, int(s.numel()))
+    u = u[:, :rank]
+    s = s[:rank]
+    vh = vh[:rank, :]
+    sroot = torch.sqrt(torch.clamp(s, min=0))
+
+    blended_B = q_left @ (u * sroot.unsqueeze(0))
+    blended_A = (sroot.unsqueeze(1) * vh) @ q_right.T
+    blended_B = blended_B.to(dtype=first.lora_B.dtype).contiguous()
+    blended_A = blended_A.to(dtype=first.lora_A.dtype).contiguous()
+    return _pad_lora_pair_to_rank(blended_B, blended_A, rank_cap)
+
+
+def _blend_3d_lora_pairs(
+    pairs: Sequence[_BlendPair],
+    rank_cap: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Blend 3D expert LoRA tensors one expert at a time."""
+    expanded: list[_BlendPair] = []
+    for pair in pairs:
+        if pair.lora_A.ndim != 3 or pair.lora_B.ndim != 3:
+            raise WeightsAdapterError("Cannot blend tensors with mixed expert LoRA dimensions")
+        lora_A, lora_B = expand_expert_lora_tensors(pair.lora_A, pair.lora_B)
+        expanded.append(
+            _BlendPair(
+                coefficient=pair.coefficient,
+                scale=pair.scale,
+                lora_A=lora_A,
+                lora_B=lora_B,
+            )
+        )
+
+    first = expanded[0]
+    num_experts = first.lora_A.shape[0]
+    in_dim = first.lora_A.shape[2]
+    out_dim = first.lora_B.shape[1]
+    for pair in expanded:
+        if (
+            pair.lora_A.shape[0] != num_experts
+            or pair.lora_B.shape[0] != num_experts
+            or pair.lora_A.shape[2] != in_dim
+            or pair.lora_B.shape[1] != out_dim
+        ):
+            raise WeightsAdapterError(
+                "Cannot blend expert LoRA tensors with different expanded shapes"
+            )
+
+    blended_A_parts: list[torch.Tensor] = []
+    blended_B_parts: list[torch.Tensor] = []
+    for expert_idx in range(num_experts):
+        expert_pairs = [
+            _BlendPair(
+                coefficient=pair.coefficient,
+                scale=pair.scale,
+                lora_A=pair.lora_A[expert_idx],
+                lora_B=pair.lora_B[expert_idx],
+            )
+            for pair in expanded
+        ]
+        expert_B, expert_A = _blend_2d_lora_pairs(expert_pairs, rank_cap)
+        blended_A_parts.append(expert_A)
+        blended_B_parts.append(expert_B)
+
+    return torch.stack(blended_B_parts, dim=0), torch.stack(blended_A_parts, dim=0)
+
+
+def _pad_lora_pair_to_rank(
+    lora_B: torch.Tensor,
+    lora_A: torch.Tensor,
+    rank_cap: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad a LoRA pair with zeros so its rank dimension matches ``rank_cap``."""
+    rank = lora_A.shape[0]
+    if rank > rank_cap:
+        raise WeightsAdapterError(f"Internal LoRA rank {rank} exceeds rank cap {rank_cap}")
+    if rank == rank_cap:
+        return lora_B.contiguous(), lora_A.contiguous()
+
+    padded_B = torch.zeros(
+        (lora_B.shape[0], rank_cap),
+        dtype=lora_B.dtype,
+        device=lora_B.device,
+    )
+    padded_A = torch.zeros(
+        (rank_cap, lora_A.shape[1]),
+        dtype=lora_A.dtype,
+        device=lora_A.device,
+    )
+    padded_B[:, :rank] = lora_B
+    padded_A[:rank, :] = lora_A
+    return padded_B.contiguous(), padded_A.contiguous()
 
 
 # ---------------------------------------------------------------------------
