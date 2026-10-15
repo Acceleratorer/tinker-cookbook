@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from functools import cache
+from pathlib import Path
 
 import chz
 import httpx
@@ -10,6 +11,7 @@ import tinker
 import torch
 from tinker import AdamParams, ModelInput
 
+from tinker_cookbook import cli_utils
 from tinker_cookbook.supervised.common import datum_from_model_input_weights
 
 
@@ -151,7 +153,9 @@ async def main(config: Config):
             df[col] = pd.NA
     df = df[required_columns]
 
-    df.to_csv("/tmp/sampling_training_logprobs.csv", index=False)
+    output_path = Path(cli_utils.runs_path("sampling_training_logprobs.csv"))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_path, index=False)
     print(df.to_markdown())
 
 
